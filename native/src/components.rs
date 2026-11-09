@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::i18n::{t, Key, Locale};
 use crate::vault;
@@ -90,6 +91,12 @@ pub enum ArchiveKind {
 pub struct FileSpec {
     pub url: String,
     pub name: String,
+    /// Expected SHA-256 (lowercase hex) of the downloaded bytes. Set for every
+    /// download that ends up executing code (the TTS and PDF shared libraries):
+    /// a mismatch aborts the install and deletes the file. `None` means the
+    /// source is a moving target (`latest` redirect, `resolve/main`) or the
+    /// payload is plain model data, so there is no fixed fingerprint to check.
+    pub sha256: Option<&'static str>,
 }
 
 /// One downloadable integration.
@@ -204,12 +211,15 @@ impl ComponentId {
                     platform.slug()
                 ),
                 name: "engine.tar.gz".to_string(),
+                // `releases/latest` changes with every release, so no fixed pin.
+                sha256: None,
             }],
             ComponentId::OcrModel => ["model.safetensors", "tokenizer.json", "config.json", "processor_config.json", "chat_template.jinja", "tokenizer_config.json"]
                 .iter()
                 .map(|name| FileSpec {
                     url: hf("xiaomi-research/Xiaomi-OCR-0", name),
                     name: name.to_string(),
+                    sha256: None,
                 })
                 .collect(),
             ComponentId::SttWhisperTiny => whisper_files("tiny"),
@@ -219,6 +229,8 @@ impl ComponentId {
                 // MUST stay pinned to v1.12.40: the FFI struct layouts in
                 // ai/tts.rs mirror c-api.h at exactly this tag (v2.0.1 dropped
                 // the `data_dir` phonemization argument and shifts layouts).
+                // The SHA-256 values are the digests GitHub recorded for the
+                // v1.12.40 release assets; re-derive them when bumping the tag.
                 url: match platform {
                     Platform::LinuxX64 => "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.40/sherpa-onnx-v1.12.40-linux-x64-shared-lib.tar.bz2",
                     Platform::MacArm64 => "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.12.40/sherpa-onnx-v1.12.40-osx-arm64-shared-lib.tar.bz2",
@@ -227,6 +239,12 @@ impl ComponentId {
                 }
                 .to_string(),
                 name: "runtime.tar.bz2".to_string(),
+                sha256: Some(match platform {
+                    Platform::LinuxX64 => "818b9fc1e9c250472112e8d91ee92156481a5c163148565cbc92d7a39bdfbd0f",
+                    Platform::MacArm64 => "9e2cc320490fc30b4dd9e07045d578bb537989a070bbc5f2c47b4a3b8b03d277",
+                    Platform::MacX64 => "7379faf3afe949ab4361821883e4d366c363dc6d74148ed64cd223887feb5276",
+                    Platform::WinX64 => "8a2793d2b89f642b4b86703b8850d3f7851b5eedb30e039c8a4119ce546d05a6",
+                }),
             }],
             ComponentId::TtsVoiceIrina => voice_files("ru_RU-irina"),
             ComponentId::TtsVoiceDmitri => voice_files("ru_RU-dmitri"),
@@ -242,6 +260,13 @@ impl ComponentId {
                     }
                 ),
                 name: "pdfium.tgz".to_string(),
+                // Digests GitHub recorded for pdfium-binaries chromium/8125.
+                sha256: Some(match platform {
+                    Platform::LinuxX64 => "e1c3ce6e270cb5e0c20816b379ad9f2c1309972697c505f508de92bf5e7d6659",
+                    Platform::MacArm64 => "4939bd935ac83ddc09a3a4f038bc43a19cea1660316a3667f26cb07a070e139d",
+                    Platform::MacX64 => "8a5193535b80c7215d8932f6647ae5097465b6dba2811602c21e120c2af112b0",
+                    Platform::WinX64 => "9a964261760cff52570aabf038ab346d3a5034dd8b30d0d5fe8861235d356b8b",
+                }),
             }],
         }
     }
@@ -279,6 +304,7 @@ fn whisper_files(model: &str) -> Vec<FileSpec> {
         .map(|name| FileSpec {
             url: format!("https://huggingface.co/openai/whisper-{model}/resolve/main/{name}"),
             name: name.to_string(),
+            sha256: None,
         })
         .collect()
 }
@@ -302,6 +328,8 @@ fn voice_files(stem: &str) -> Vec<FileSpec> {
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-{stem}-medium.tar.bz2"
         ),
         name: format!("voice-{stem}.tar.bz2"),
+        // Voice models are data, and the `tts-models` tag is a moving target.
+        sha256: None,
     }]
 }
 
@@ -695,11 +723,13 @@ fn fetch_file(
         fs::File::create(dir.join(&file.name)).map_err(|e| format!("create {}: {e}", file.name))?;
     let mut buffer = [0u8; 64 * 1024];
     let mut got: u64 = 0;
+    let mut hasher = Sha256::new();
     loop {
         let read = reader.read(&mut buffer).map_err(|e| format!("read: {e}"))?;
         if read == 0 {
             break;
         }
+        hasher.update(&buffer[..read]);
         out.write_all(&buffer[..read])
             .map_err(|e| format!("write: {e}"))?;
         got += read as u64;
@@ -712,7 +742,28 @@ fn fetch_file(
             return Err(format!("{}: got {got} of {total} bytes", file.name));
         }
     }
+    drop(out);
+    let actual = hex_digest(hasher.finalize().as_slice());
+    if let Err(message) = check_pin(&file.name, file.sha256, &actual) {
+        // Never leave an unverified file behind where unpacking could find it.
+        let _ = fs::remove_file(dir.join(&file.name));
+        return Err(message);
+    }
     Ok(())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Compare a computed SHA-256 against the pinned one. `None` = nothing pinned.
+fn check_pin(name: &str, expected: Option<&str>, actual: &str) -> Result<(), String> {
+    match expected {
+        Some(pin) if !pin.eq_ignore_ascii_case(actual) => Err(format!(
+            "{name}: integrity check failed (expected sha256 {pin}, got {actual}); download discarded"
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn unpack_tar_gz(path: &Path, dest: &Path) -> Result<(), String> {
@@ -791,6 +842,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn code_bearing_downloads_are_pinned_on_every_platform() {
+        // The TTS and PDF components are shared libraries the app loads and
+        // runs, so every platform build must carry a well-formed SHA-256 pin.
+        for id in [ComponentId::TtsRuntime, ComponentId::PdfEngine] {
+            for platform in [
+                Platform::LinuxX64,
+                Platform::MacArm64,
+                Platform::MacX64,
+                Platform::WinX64,
+            ] {
+                for file in id.files(platform) {
+                    let pin = file
+                        .sha256
+                        .unwrap_or_else(|| panic!("{:?}/{:?} has no sha256 pin", id, platform));
+                    assert_eq!(pin.len(), 64, "{pin}");
+                    assert!(
+                        pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                        "{pin}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn check_pin_accepts_match_and_rejects_mismatch() {
+        // sha256("abc")
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let computed = hex_digest(Sha256::digest(b"abc").as_slice());
+        assert_eq!(computed, abc);
+        assert!(check_pin("f", Some(abc), &computed).is_ok());
+        assert!(check_pin("f", Some(&abc.to_uppercase()), &computed).is_ok());
+        assert!(check_pin("f", None, &computed).is_ok());
+        let err = check_pin("f", Some(abc), &hex_digest(Sha256::digest(b"abd").as_slice()))
+            .unwrap_err();
+        assert!(err.contains("integrity check failed"), "{err}");
     }
 
     #[test]
